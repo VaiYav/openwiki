@@ -40,6 +40,7 @@ import {
 } from "../okf/index-labels.js";
 import {
   getPrimaryLanguageSubtag,
+  requireResolvedLanguage,
   resolveLanguage,
 } from "../platform/language.js";
 import { isFileNotFoundError } from "../platform/fs-errors.js";
@@ -54,8 +55,8 @@ import {
 } from "./page-manifest.js";
 import {
   createRepositoryPlan,
-  replacePageClaims,
-  type ProposedPageClaim,
+  reconcilePageClaims,
+  type ProposedPageClaimReconciliation,
   type ProposedRepositoryPlan,
 } from "./page-jobs.js";
 import {
@@ -319,6 +320,17 @@ export async function beginRepositoryRun(
   input: BeginRepositoryRunInput,
 ): Promise<BeginRepositoryRunResult> {
   const now = input.now ?? (() => new Date());
+  // Reject an unrecognized language before touching the repository. Falling
+  // back to English here would persist the wrong language in run state, and
+  // resume refuses to change a started run's language, so the caller could not
+  // correct the typo without deleting OpenWiki's own state files.
+  const resolvedRequest = resolveLanguage(input.language);
+  if (resolvedRequest.kind === "unrecognized") {
+    throw new RepositoryRunError("invalid_input", resolvedRequest.message);
+  }
+  const requestedLanguage =
+    resolvedRequest.kind === "resolved" ? resolvedRequest.language : undefined;
+
   await ensureCodeModeRepoSetup(input.root, {
     createWorkflow: input.mode === "init",
   });
@@ -334,7 +346,6 @@ export async function beginRepositoryRun(
     input.language,
   );
   const language = context.language ?? "en";
-  const requestedLanguage = resolveLanguage(input.language).language;
   const languageChanged =
     requestedLanguage !== undefined &&
     getPrimaryLanguageSubtag(requestedLanguage) !==
@@ -533,6 +544,17 @@ export async function beginRepositoryRun(
 }
 
 /**
+ * True when a backend result error indicates a file does not exist.
+ *
+ * Matches both the standard `"file_not_found"` error code used by some backends
+ * and the human-readable `"Error: File '...' not found"` string returned by
+ * DeepAgents' filesystem backends (see #765).
+ */
+function isNotFoundBackendError(error: string): boolean {
+  return error === "file_not_found" || error.includes("not found");
+}
+
+/**
  * Reconstructs a durable run and invalidates its complete plan on source drift.
  *
  * @param input - Current begin request used to validate the durable owner.
@@ -551,7 +573,7 @@ async function resumeRepositoryRun(
     );
   }
 
-  const requestedLanguage = resolveLanguage(input.language).language;
+  const requestedLanguage = requireResolvedLanguage(input.language);
   if (requestedLanguage && requestedLanguage !== state.language) {
     throw new RepositoryRunError(
       "conflict",
@@ -939,7 +961,8 @@ export type NextRepositoryPageResult =
       job: PageJob & {
         mode: RepositoryRunMode;
         existing: boolean;
-        existingClaims: InspectedClaim[];
+        existingClaimCount: number;
+        claimsRequiringAttention: InspectedClaim[];
       };
     }
   | { status: "complete" };
@@ -972,14 +995,46 @@ export async function nextRepositoryPage(
     if (!isFileNotFoundError(error)) throw error;
   }
 
+  const existingClaims = run.claimsRuntime.session.inspectClaims(job.path);
   return {
     status: "pending",
     job: {
       ...job,
       mode: run.state.mode,
       existing,
-      existingClaims: run.claimsRuntime.session.inspectClaims(job.path),
+      existingClaimCount: existingClaims.length,
+      claimsRequiringAttention: existingClaims.filter(({ issue }) => issue),
     },
+  };
+}
+
+/**
+ * Returns the complete compact Claim set for the current pending page on demand.
+ *
+ * Normal focused updates do not need this payload: current issue-free Claims
+ * are retained deterministically. Workers use this only when they intentionally
+ * revise or remove otherwise-current page content and need the owning Claim ids.
+ *
+ * @param run - Active run with a durably installed plan.
+ * @param jobId - Current pending page job identifier.
+ * @returns Complete model-facing Claims without opaque evidence versions.
+ */
+export function inspectRepositoryPageClaims(
+  run: ActiveRepositoryRun,
+  jobId: string,
+): { page: string; claims: InspectedClaim[] } {
+  const current = run.state.plan?.pages.find(
+    ({ status }) => status === "pending",
+  );
+  if (!current || current.id !== jobId) {
+    throw new RepositoryRunError(
+      "invalid_state",
+      "Only the current pending OpenWiki page job's Claims may be inspected.",
+    );
+  }
+  return {
+    page: current.path,
+    claims: run.claimsRuntime.session.inspectClaims(current.path),
   };
 }
 
@@ -1003,7 +1058,7 @@ export async function captureRepositoryPageSnapshot(
   let markdown: string | null = null;
   try {
     const read = await run.backend.readRaw(current.path);
-    if (read.error && read.error !== "file_not_found") {
+    if (read.error && !isNotFoundBackendError(read.error)) {
       throw new RepositoryRunError(
         "invalid_state",
         `Could not snapshot ${current.path}: ${read.error}`,
@@ -1107,7 +1162,7 @@ async function restoreRepositoryPageMarkdown(
       : await run.backend.write(snapshot.path, snapshot.markdown);
   if (
     result.error &&
-    !(snapshot.markdown === null && result.error === "file_not_found")
+    !(snapshot.markdown === null && isNotFoundBackendError(result.error))
   ) {
     throw new RepositoryRunError(
       "invalid_state",
@@ -1127,10 +1182,7 @@ async function restoreRepositoryPageMarkdown(
  */
 export async function submitRepositoryPage(
   run: ActiveRepositoryRun,
-  input: {
-    jobId: string;
-    claims: ProposedPageClaim[];
-  },
+  input: { jobId: string } & ProposedPageClaimReconciliation,
 ): Promise<{ status: "complete"; page: string; remaining: number }> {
   const plan = run.state.plan;
   if (!plan || run.state.phase !== "generating") {
@@ -1196,11 +1248,7 @@ export async function submitRepositoryPage(
   }
 
   try {
-    await replacePageClaims(
-      run.claimsRuntime.session,
-      current.path,
-      input.claims,
-    );
+    await reconcilePageClaims(run.claimsRuntime.session, current.path, input);
     // Persist the page's dirty Claim state before recording job completion.
     // Prove this page is durable before advancing the queue; the strict
     // whole-run proof waits until every PageJob is complete.
@@ -1570,7 +1618,7 @@ async function applyAbandonedGeneratedPageDeletions(
   for (const page of await store.discoverPages()) {
     if (initial.has(page) || planned.has(page)) continue;
     const result = await run.backend.delete(page);
-    if (result.error && result.error !== "file_not_found") {
+    if (result.error && !isNotFoundBackendError(result.error)) {
       throw new RepositoryRunError(
         "invalid_state",
         `Could not remove page abandoned by an invalidated plan ${page}: ${result.error}`,
@@ -1592,7 +1640,7 @@ async function applyPlannedDeletions(
 ): Promise<void> {
   for (const page of pages) {
     const result = await run.backend.delete(page);
-    if (result.error && result.error !== "file_not_found") {
+    if (result.error && !isNotFoundBackendError(result.error)) {
       throw new RepositoryRunError(
         "invalid_state",
         `Could not delete planned OpenWiki page ${page}: ${result.error}`,
